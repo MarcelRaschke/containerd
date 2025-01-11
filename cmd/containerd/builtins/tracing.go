@@ -1,5 +1,4 @@
 //go:build !no_tracing
-// +build !no_tracing
 
 /*
    Copyright The containerd Authors.
@@ -20,5 +19,5 @@
 package builtins
 
 import (
-	_ "github.com/containerd/containerd/tracing/plugin"
+	_ "github.com/containerd/containerd/v2/pkg/tracing/plugin"
 )

@@ -22,7 +22,7 @@ import (
 )
 
 // FromOCILinuxResources returns resources from an OCI runtime Spec.
-func FromOCILinuxResources(o *rspec.LinuxResources, ann map[string]string) *LinuxResources {
+func FromOCILinuxResources(o *rspec.LinuxResources, _ map[string]string) *LinuxResources {
 	if o == nil {
 		return nil
 	}
@@ -65,6 +65,11 @@ func FromOCILinuxResources(o *rspec.LinuxResources, ann map[string]string) *Linu
 			Access: d.Access,
 		})
 	}
+	if p := o.Pids; p != nil {
+		l.Pids = &LinuxPids{
+			Limit: p.Limit,
+		}
+	}
 	return l
 }
 
@@ -100,7 +105,10 @@ func (r *LinuxResources) ToOCI() *rspec.LinuxResources {
 	if r == nil {
 		return nil
 	}
-	o := &rspec.LinuxResources{}
+	o := &rspec.LinuxResources{
+		CPU:    &rspec.LinuxCPU{},
+		Memory: &rspec.LinuxMemory{},
+	}
 	if r.Memory != nil {
 		o.Memory = &rspec.LinuxMemory{
 			Limit:            r.Memory.Limit.Get(),
@@ -145,7 +153,11 @@ func (r *LinuxResources) ToOCI() *rspec.LinuxResources {
 			Access: d.Access,
 		})
 	}
-
+	if r.Pids != nil {
+		o.Pids = &rspec.LinuxPids{
+			Limit: r.Pids.Limit,
+		}
+	}
 	return o
 }
 
@@ -221,6 +233,11 @@ func (r *LinuxResources) Copy() *LinuxResources {
 		o.Unified = make(map[string]string)
 		for k, v := range r.Unified {
 			o.Unified[k] = v
+		}
+	}
+	if r.Pids != nil {
+		o.Pids = &LinuxPids{
+			Limit: r.Pids.Limit,
 		}
 	}
 	o.BlockioClass = String(r.BlockioClass)

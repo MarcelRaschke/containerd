@@ -20,16 +20,10 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/containerd/containerd/cmd/containerd/command"
-	"github.com/containerd/containerd/pkg/seed"
+	"github.com/containerd/containerd/v2/cmd/containerd/command"
 
-	_ "github.com/containerd/containerd/cmd/containerd/builtins"
-	_ "github.com/containerd/containerd/pkg/cri"
+	_ "github.com/containerd/containerd/v2/cmd/containerd/builtins"
 )
-
-func init() {
-	seed.WithTimeAndRand()
-}
 
 func main() {
 	app := command.App()

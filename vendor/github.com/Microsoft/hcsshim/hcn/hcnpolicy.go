@@ -144,10 +144,11 @@ type QosPolicySetting struct {
 
 // OutboundNatPolicySetting sets outbound Network Address Translation on an Endpoint.
 type OutboundNatPolicySetting struct {
-	VirtualIP    string   `json:",omitempty"`
-	Exceptions   []string `json:",omitempty"`
-	Destinations []string `json:",omitempty"`
-	Flags        NatFlags `json:",omitempty"`
+	VirtualIP        string   `json:",omitempty"`
+	Exceptions       []string `json:",omitempty"`
+	Destinations     []string `json:",omitempty"`
+	Flags            NatFlags `json:",omitempty"`
+	MaxPortPoolUsage uint16   `json:",omitempty"`
 }
 
 // SDNRoutePolicySetting sets SDN Route on an Endpoint.
@@ -315,7 +316,7 @@ const (
 	ProtocolTypeICMPv6  ProtocolType = 58
 )
 
-//L4ProxyPolicySetting applies proxy policy on network/endpoint
+// L4ProxyPolicySetting applies proxy policy on network/endpoint
 type L4ProxyPolicySetting struct {
 	IP          string       `json:",omitempty"`
 	Port        string       `json:",omitempty"`

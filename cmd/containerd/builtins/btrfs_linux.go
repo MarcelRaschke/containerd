@@ -1,5 +1,4 @@
 //go:build !no_btrfs && cgo
-// +build !no_btrfs,cgo
 
 /*
    Copyright The containerd Authors.
@@ -19,4 +18,4 @@
 
 package builtins
 
-import _ "github.com/containerd/containerd/snapshots/btrfs/plugin"
+import _ "github.com/containerd/containerd/v2/plugins/snapshots/btrfs/plugin"

@@ -1,5 +1,4 @@
 //go:build windows
-// +build windows
 
 /*
    Copyright The containerd Authors.
@@ -22,12 +21,15 @@ package integration
 import (
 	"fmt"
 	"os"
+	"strconv"
 	"testing"
 	"time"
 
-	"github.com/containerd/containerd/integration/images"
+	"github.com/Microsoft/hcsshim/osversion"
+	"github.com/containerd/containerd/v2/integration/images"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/sys/windows/registry"
 	runtime "k8s.io/cri-api/pkg/apis/runtime/v1"
 	v1 "k8s.io/cri-api/pkg/apis/runtime/v1"
 )
@@ -123,4 +125,75 @@ func runHostProcess(t *testing.T, expectErr bool, image string, action hpcAction
 	}()
 
 	action(t, cn, containerConfig)
+}
+
+func runExecAndRemoveContainer(t *testing.T, sb string, sbConfig *runtime.PodSandboxConfig, cnConfig *runtime.ContainerConfig) {
+	t.Log("Create the container")
+	cn, err := runtimeService.CreateContainer(sb, cnConfig, sbConfig)
+	require.NoError(t, err)
+	t.Log("Start the container")
+	require.NoError(t, runtimeService.StartContainer(cn))
+	// Wait few seconds for the container to be completely initialized
+	time.Sleep(5 * time.Second)
+
+	cmd := []string{"cmd", "/c", "echo", "hello"}
+	timeoutDuration := 10 * time.Second
+	stdout, _, err := runtimeService.ExecSync(cn, cmd, timeoutDuration)
+	require.NoError(t, err)
+	t.Logf("Exec response: %v", stdout)
+	require.Equal(t, "hello\r\n", string(stdout))
+
+	t.Log("Stop the container")
+	require.NoError(t, runtimeService.StopContainer(cn, 0))
+	t.Log("Remove the container")
+	require.NoError(t, runtimeService.RemoveContainer(cn))
+}
+
+func TestArgsEscapedImagesOnWindows(t *testing.T) {
+	// the ArgsEscaped test image is based on nanoserver:ltsc2022, so ensure we run on the correct OS version
+	k, err := registry.OpenKey(registry.LOCAL_MACHINE, `SOFTWARE\Microsoft\Windows NT\CurrentVersion`, registry.QUERY_VALUE)
+	if err != nil {
+		t.Skip("Error in getting OS version")
+	}
+	defer k.Close()
+
+	b, _, _ := k.GetStringValue("CurrentBuild")
+	buildNum, _ := strconv.Atoi(b)
+	if buildNum < osversion.V21H2Server {
+		t.Skip()
+	}
+
+	containerName := "test-container"
+	testImage := images.Get(images.ArgsEscaped)
+	sbConfig := &runtime.PodSandboxConfig{
+		Metadata: &runtime.PodSandboxMetadata{
+			Name:      "sandbox",
+			Namespace: testImage,
+		},
+		Windows: &runtime.WindowsPodSandboxConfig{},
+	}
+	sb, err := runtimeService.RunPodSandbox(sbConfig, *runtimeHandler)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		assert.NoError(t, runtimeService.StopPodSandbox(sb))
+		assert.NoError(t, runtimeService.RemovePodSandbox(sb))
+	})
+
+	EnsureImageExists(t, testImage)
+
+	cnConfigWithCtrCmd := ContainerConfig(
+		containerName,
+		testImage,
+		WithCommand("ping", "-t", "127.0.0.1"),
+		localSystemUsername,
+	)
+
+	cnConfigNoCtrCmd := ContainerConfig(
+		containerName,
+		testImage,
+		localSystemUsername,
+	)
+
+	runExecAndRemoveContainer(t, sb, sbConfig, cnConfigWithCtrCmd)
+	runExecAndRemoveContainer(t, sb, sbConfig, cnConfigNoCtrCmd)
 }

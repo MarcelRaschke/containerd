@@ -20,6 +20,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/signal"
@@ -28,34 +29,43 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/containerd/containerd"
-	"github.com/containerd/containerd/cio"
-	"github.com/containerd/containerd/namespaces"
-	"github.com/containerd/containerd/oci"
-	"github.com/sirupsen/logrus"
-	"github.com/urfave/cli"
+	containerd "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/pkg/cio"
+	"github.com/containerd/containerd/v2/pkg/namespaces"
+	"github.com/containerd/containerd/v2/pkg/oci"
+	"github.com/containerd/log"
+	"github.com/urfave/cli/v2"
 )
 
-var densityCommand = cli.Command{
+var densityCommand = &cli.Command{
 	Name:  "density",
-	Usage: "stress tests density of containers running on a system",
+	Usage: "Stress tests density of containers running on a system",
 	Flags: []cli.Flag{
-		cli.IntFlag{
+		&cli.IntFlag{
 			Name:  "count",
-			Usage: "number of containers to run",
+			Usage: "Number of containers to run",
 			Value: 10,
 		},
 	},
 	Action: func(cliContext *cli.Context) error {
+		var (
+			pids  []uint32
+			count = cliContext.Int("count")
+		)
+
+		if count < 1 {
+			return errors.New("count cannot be less than one")
+		}
+
 		config := config{
-			Address:     cliContext.GlobalString("address"),
-			Duration:    cliContext.GlobalDuration("duration"),
-			Concurrency: cliContext.GlobalInt("concurrent"),
-			Exec:        cliContext.GlobalBool("exec"),
-			Image:       cliContext.GlobalString("image"),
-			JSON:        cliContext.GlobalBool("json"),
-			Metrics:     cliContext.GlobalString("metrics"),
-			Snapshotter: cliContext.GlobalString("snapshotter"),
+			Address:     cliContext.String("address"),
+			Duration:    cliContext.Duration("duration"),
+			Concurrency: cliContext.Int("concurrent"),
+			Exec:        cliContext.Bool("exec"),
+			Image:       cliContext.String("image"),
+			JSON:        cliContext.Bool("json"),
+			Metrics:     cliContext.String("metrics"),
+			Snapshotter: cliContext.String("snapshotter"),
 		}
 		client, err := config.newClient()
 		if err != nil {
@@ -66,20 +76,16 @@ var densityCommand = cli.Command{
 		if err := cleanup(ctx, client); err != nil {
 			return err
 		}
-		logrus.Infof("pulling %s", config.Image)
+		log.L.Infof("pulling %s", config.Image)
 		image, err := client.Pull(ctx, config.Image, containerd.WithPullUnpack, containerd.WithPullSnapshotter(config.Snapshotter))
 		if err != nil {
 			return err
 		}
-		logrus.Info("generating spec from image")
+		log.L.Info("generating spec from image")
 
 		s := make(chan os.Signal, 1)
 		signal.Notify(s, syscall.SIGTERM, syscall.SIGINT)
 
-		var (
-			pids  []uint32
-			count = cliContext.Int("count")
-		)
 	loop:
 		for i := 0; i < count+1; i++ {
 			select {

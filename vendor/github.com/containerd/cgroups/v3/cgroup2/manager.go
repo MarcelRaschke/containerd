@@ -21,34 +21,33 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
+	"io/fs"
 	"math"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/containerd/cgroups/v3/cgroup2/stats"
 
+	"github.com/containerd/log"
 	systemdDbus "github.com/coreos/go-systemd/v22/dbus"
 	"github.com/godbus/dbus/v5"
 	"github.com/opencontainers/runtime-spec/specs-go"
-	"github.com/sirupsen/logrus"
 	"golang.org/x/sys/unix"
 )
 
 const (
 	subtreeControl     = "cgroup.subtree_control"
 	controllersFile    = "cgroup.controllers"
+	killFile           = "cgroup.kill"
+	typeFile           = "cgroup.type"
 	defaultCgroup2Path = "/sys/fs/cgroup"
 	defaultSlice       = "system.slice"
 )
 
-var (
-	canDelegate bool
-)
+var canDelegate bool
 
 type Event struct {
 	Low     uint64
@@ -98,7 +97,9 @@ func (r *Resources) Values() (o []Value) {
 func (r *Resources) EnabledControllers() (c []string) {
 	if r.CPU != nil {
 		c = append(c, "cpu")
-		c = append(c, "cpuset")
+		if r.CPU.Cpus != "" || r.CPU.Mems != "" {
+			c = append(c, "cpuset")
+		}
 	}
 	if r.Memory != nil {
 		c = append(c, "memory")
@@ -144,20 +145,11 @@ func (c *Value) write(path string, perm os.FileMode) error {
 		return ErrInvalidFormat
 	}
 
-	// Retry writes on EINTR; see:
-	//    https://github.com/golang/go/issues/38033
-	for {
-		err := os.WriteFile(
-			filepath.Join(path, c.filename),
-			data,
-			perm,
-		)
-		if err == nil {
-			return nil
-		} else if !errors.Is(err, syscall.EINTR) {
-			return err
-		}
-	}
+	return os.WriteFile(
+		filepath.Join(path, c.filename),
+		data,
+		perm,
+	)
 }
 
 func writeValues(path string, values []Value) error {
@@ -202,7 +194,7 @@ type InitConfig struct {
 
 type InitOpts func(c *InitConfig) error
 
-// WithMountpoint sets the unified mountpoint. The deault path is /sys/fs/cgroup.
+// WithMountpoint sets the unified mountpoint. The default path is /sys/fs/cgroup.
 func WithMountpoint(path string) InitOpts {
 	return func(c *InitConfig) error {
 		c.mountpoint = path
@@ -244,6 +236,37 @@ func setResources(path string, resources *Resources) error {
 		}
 	}
 	return nil
+}
+
+// CgroupType represents the types a cgroup can be.
+type CgroupType string
+
+const (
+	Domain         CgroupType = "domain"
+	DomainThreaded CgroupType = "domain threaded"
+	DomainInvalid  CgroupType = "domain invalid"
+	Threaded       CgroupType = "threaded"
+)
+
+func (c *Manager) GetType() (CgroupType, error) {
+	val, err := os.ReadFile(filepath.Join(c.path, typeFile))
+	if err != nil {
+		return "", err
+	}
+	trimmed := strings.TrimSpace(string(val))
+	return CgroupType(trimmed), nil
+}
+
+func (c *Manager) SetType(cgType CgroupType) error {
+	// NOTE: We could abort if cgType != Threaded here as currently
+	// it's not possible to revert back to domain, but not sure
+	// it's worth being that opinionated, especially if that may
+	// ever change.
+	v := Value{
+		filename: typeFile,
+		value:    string(cgType),
+	}
+	return writeValues(c.path, []Value{v})
 }
 
 func (c *Manager) RootControllers() ([]string, error) {
@@ -296,7 +319,7 @@ func (c *Manager) ToggleControllers(controllers []string, t ControllerToggle) er
 		}
 		filePath := filepath.Join(f, subtreeControl)
 		if err := c.writeSubtreeControl(filePath, controllers, t); err != nil {
-			// When running as rootless, the user may face EPERM on parent groups, but it is neglible when the
+			// When running as rootless, the user may face EPERM on parent groups, but it is negligible when the
 			// controller is already written.
 			// So we only return the last error.
 			lastErr = fmt.Errorf("failed to write subtree controllers %+v to %q: %w", controllers, filePath, err)
@@ -366,21 +389,119 @@ func (c *Manager) AddThread(tid uint64) error {
 	return writeValues(c.path, []Value{v})
 }
 
+// Kill will try to forcibly exit all of the processes in the cgroup. This is
+// equivalent to sending a SIGKILL to every process. On kernels 5.14 and greater
+// this will use the cgroup.kill file, on anything that doesn't have the cgroup.kill
+// file, a manual process of freezing -> sending a SIGKILL to every process -> thawing
+// will be used.
+func (c *Manager) Kill() error {
+	v := Value{
+		filename: killFile,
+		value:    "1",
+	}
+	err := writeValues(c.path, []Value{v})
+	if err == nil {
+		return nil
+	}
+	log.L.Warnf("falling back to slower kill implementation: %s", err)
+	// Fallback to slow method.
+	return c.fallbackKill()
+}
+
+// fallbackKill is a slower fallback to the more modern (kernels 5.14+)
+// approach of writing to the cgroup.kill file. This is heavily pulled
+// from runc's same approach (in signalAllProcesses), with the only differences
+// being this is just tailored to the API exposed in this library, and we don't
+// need to care about signals other than SIGKILL.
+//
+// https://github.com/opencontainers/runc/blob/8da0a0b5675764feaaaaad466f6567a9983fcd08/libcontainer/init_linux.go#L523-L529
+func (c *Manager) fallbackKill() error {
+	logger := log.G(context.TODO()).WithFields(log.Fields{"path": c.path})
+
+	if err := c.Freeze(); err != nil {
+		logger.WithError(err).Warn("freezing cgroup2.manager")
+	}
+	pids, err := c.Procs(true)
+	if err != nil {
+		if err := c.Thaw(); err != nil {
+			logger.WithError(err).Warn("thawing cgroup2.manager")
+		}
+		return err
+	}
+	var procs []*os.Process
+	for _, pid := range pids {
+		p, err := os.FindProcess(int(pid))
+		if err != nil {
+			logger.WithFields(log.Fields{"error": err, "pid": int(pid)}).Warnf("finding process")
+			continue
+		}
+		procs = append(procs, p)
+		if err := p.Signal(unix.SIGKILL); err != nil {
+			logger.WithFields(log.Fields{"error": err, "pid": int(pid)}).Warnf("signaling process")
+		}
+	}
+	if err := c.Thaw(); err != nil {
+		logger.WithError(err).Warn("thawing cgroup2.manager")
+	}
+
+	subreaper, err := getSubreaper()
+	if err != nil {
+		// The error here means that PR_GET_CHILD_SUBREAPER is not
+		// supported because this code might run on a kernel older
+		// than 3.4. We don't want to throw an error in that case,
+		// and we simplify things, considering there is no subreaper
+		// set.
+		subreaper = 0
+	}
+
+	for _, p := range procs {
+		// In case a subreaper has been setup, this code must not
+		// wait for the process. Otherwise, we cannot be sure the
+		// current process will be reaped by the subreaper, while
+		// the subreaper might be waiting for this process in order
+		// to retrieve its exit code.
+		if subreaper == 0 {
+			if _, err := p.Wait(); err != nil {
+				if !errors.Is(err, unix.ECHILD) {
+					logger.WithFields(log.Fields{"error": err, "pid": p.Pid}).Warn("waiting on process")
+				}
+			}
+		}
+	}
+	return nil
+}
+
 func (c *Manager) Delete() error {
-	// kernel prevents cgroups with running process from being removed, check the tree is empty
-	processes, err := c.Procs(true)
+	// Kernel prevents cgroups with running process from being removed,
+	// check the tree is empty.
+	//
+	// Pick the right file to read based on the cgs type.
+	cgType, err := c.GetType()
+	if err != nil {
+		if !os.IsNotExist(err) {
+			return err
+		}
+	}
+
+	var tasks []uint64
+	switch cgType {
+	case Threaded, DomainThreaded:
+		tasks, err = c.Threads(true)
+	default:
+		tasks, err = c.Procs(true)
+	}
 	if err != nil {
 		return err
 	}
-	if len(processes) > 0 {
-		return fmt.Errorf("cgroups: unable to remove path %q: still contains running processes", c.path)
+	if len(tasks) > 0 {
+		return fmt.Errorf("cgroups: unable to remove path %q: still contains running tasks", c.path)
 	}
 	return remove(c.path)
 }
 
-func (c *Manager) Procs(recursive bool) ([]uint64, error) {
-	var processes []uint64
-	err := filepath.Walk(c.path, func(p string, info os.FileInfo, err error) error {
+func (c *Manager) getTasks(recursive bool, tType string) ([]uint64, error) {
+	var tasks []uint64
+	err := filepath.Walk(c.path, func(p string, info fs.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
@@ -391,17 +512,25 @@ func (c *Manager) Procs(recursive bool) ([]uint64, error) {
 			return filepath.SkipDir
 		}
 		_, name := filepath.Split(p)
-		if name != cgroupProcs {
+		if name != tType {
 			return nil
 		}
-		procs, err := parseCgroupProcsFile(p)
+		curTasks, err := parseCgroupTasksFile(p)
 		if err != nil {
 			return err
 		}
-		processes = append(processes, procs...)
+		tasks = append(tasks, curTasks...)
 		return nil
 	})
-	return processes, err
+	return tasks, err
+}
+
+func (c *Manager) Procs(recursive bool) ([]uint64, error) {
+	return c.getTasks(recursive, cgroupProcs)
+}
+
+func (c *Manager) Threads(recursive bool) ([]uint64, error) {
+	return c.getTasks(recursive, cgroupThreads)
 }
 
 func (c *Manager) MoveTo(destination *Manager) error {
@@ -420,17 +549,15 @@ func (c *Manager) MoveTo(destination *Manager) error {
 	return nil
 }
 
-var singleValueFiles = []string{
-	"pids.current",
-	"pids.max",
-}
-
 func (c *Manager) Stat() (*stats.Metrics, error) {
 	controllers, err := c.Controllers()
 	if err != nil {
 		return nil, err
 	}
-	out := make(map[string]interface{})
+	// Sizing this avoids an allocation to increase the map at runtime;
+	// currently the default bucket size is 8 and we put 40+ elements
+	// in it so we'd always end up allocating.
+	out := make(map[string]uint64, 50)
 	for _, controller := range controllers {
 		switch controller {
 		case "cpu", "memory":
@@ -442,81 +569,80 @@ func (c *Manager) Stat() (*stats.Metrics, error) {
 			}
 		}
 	}
-	for _, name := range singleValueFiles {
-		if err := readSingleFile(c.path, name, out); err != nil {
-			if os.IsNotExist(err) {
-				continue
-			}
-			return nil, err
-		}
-	}
-	memoryEvents := make(map[string]interface{})
+	memoryEvents := make(map[string]uint64)
 	if err := readKVStatsFile(c.path, "memory.events", memoryEvents); err != nil {
 		if !os.IsNotExist(err) {
 			return nil, err
 		}
 	}
-	var metrics stats.Metrics
 
+	var metrics stats.Metrics
 	metrics.Pids = &stats.PidsStat{
-		Current: getPidValue("pids.current", out),
-		Limit:   getPidValue("pids.max", out),
+		Current: getStatFileContentUint64(filepath.Join(c.path, "pids.current")),
+		Limit:   getStatFileContentUint64(filepath.Join(c.path, "pids.max")),
 	}
 	metrics.CPU = &stats.CPUStat{
-		UsageUsec:     getUint64Value("usage_usec", out),
-		UserUsec:      getUint64Value("user_usec", out),
-		SystemUsec:    getUint64Value("system_usec", out),
-		NrPeriods:     getUint64Value("nr_periods", out),
-		NrThrottled:   getUint64Value("nr_throttled", out),
-		ThrottledUsec: getUint64Value("throttled_usec", out),
+		UsageUsec:     out["usage_usec"],
+		UserUsec:      out["user_usec"],
+		SystemUsec:    out["system_usec"],
+		NrPeriods:     out["nr_periods"],
+		NrThrottled:   out["nr_throttled"],
+		ThrottledUsec: out["throttled_usec"],
+		PSI:           getStatPSIFromFile(filepath.Join(c.path, "cpu.pressure")),
 	}
 	metrics.Memory = &stats.MemoryStat{
-		Anon:                  getUint64Value("anon", out),
-		File:                  getUint64Value("file", out),
-		KernelStack:           getUint64Value("kernel_stack", out),
-		Slab:                  getUint64Value("slab", out),
-		Sock:                  getUint64Value("sock", out),
-		Shmem:                 getUint64Value("shmem", out),
-		FileMapped:            getUint64Value("file_mapped", out),
-		FileDirty:             getUint64Value("file_dirty", out),
-		FileWriteback:         getUint64Value("file_writeback", out),
-		AnonThp:               getUint64Value("anon_thp", out),
-		InactiveAnon:          getUint64Value("inactive_anon", out),
-		ActiveAnon:            getUint64Value("active_anon", out),
-		InactiveFile:          getUint64Value("inactive_file", out),
-		ActiveFile:            getUint64Value("active_file", out),
-		Unevictable:           getUint64Value("unevictable", out),
-		SlabReclaimable:       getUint64Value("slab_reclaimable", out),
-		SlabUnreclaimable:     getUint64Value("slab_unreclaimable", out),
-		Pgfault:               getUint64Value("pgfault", out),
-		Pgmajfault:            getUint64Value("pgmajfault", out),
-		WorkingsetRefault:     getUint64Value("workingset_refault", out),
-		WorkingsetActivate:    getUint64Value("workingset_activate", out),
-		WorkingsetNodereclaim: getUint64Value("workingset_nodereclaim", out),
-		Pgrefill:              getUint64Value("pgrefill", out),
-		Pgscan:                getUint64Value("pgscan", out),
-		Pgsteal:               getUint64Value("pgsteal", out),
-		Pgactivate:            getUint64Value("pgactivate", out),
-		Pgdeactivate:          getUint64Value("pgdeactivate", out),
-		Pglazyfree:            getUint64Value("pglazyfree", out),
-		Pglazyfreed:           getUint64Value("pglazyfreed", out),
-		ThpFaultAlloc:         getUint64Value("thp_fault_alloc", out),
-		ThpCollapseAlloc:      getUint64Value("thp_collapse_alloc", out),
+		Anon:                  out["anon"],
+		File:                  out["file"],
+		KernelStack:           out["kernel_stack"],
+		Slab:                  out["slab"],
+		Sock:                  out["sock"],
+		Shmem:                 out["shmem"],
+		FileMapped:            out["file_mapped"],
+		FileDirty:             out["file_dirty"],
+		FileWriteback:         out["file_writeback"],
+		AnonThp:               out["anon_thp"],
+		InactiveAnon:          out["inactive_anon"],
+		ActiveAnon:            out["active_anon"],
+		InactiveFile:          out["inactive_file"],
+		ActiveFile:            out["active_file"],
+		Unevictable:           out["unevictable"],
+		SlabReclaimable:       out["slab_reclaimable"],
+		SlabUnreclaimable:     out["slab_unreclaimable"],
+		Pgfault:               out["pgfault"],
+		Pgmajfault:            out["pgmajfault"],
+		WorkingsetRefault:     out["workingset_refault"],
+		WorkingsetActivate:    out["workingset_activate"],
+		WorkingsetNodereclaim: out["workingset_nodereclaim"],
+		Pgrefill:              out["pgrefill"],
+		Pgscan:                out["pgscan"],
+		Pgsteal:               out["pgsteal"],
+		Pgactivate:            out["pgactivate"],
+		Pgdeactivate:          out["pgdeactivate"],
+		Pglazyfree:            out["pglazyfree"],
+		Pglazyfreed:           out["pglazyfreed"],
+		ThpFaultAlloc:         out["thp_fault_alloc"],
+		ThpCollapseAlloc:      out["thp_collapse_alloc"],
 		Usage:                 getStatFileContentUint64(filepath.Join(c.path, "memory.current")),
 		UsageLimit:            getStatFileContentUint64(filepath.Join(c.path, "memory.max")),
+		MaxUsage:              getStatFileContentUint64(filepath.Join(c.path, "memory.peak")),
 		SwapUsage:             getStatFileContentUint64(filepath.Join(c.path, "memory.swap.current")),
 		SwapLimit:             getStatFileContentUint64(filepath.Join(c.path, "memory.swap.max")),
+		SwapMaxUsage:          getStatFileContentUint64(filepath.Join(c.path, "memory.swap.peak")),
+		PSI:                   getStatPSIFromFile(filepath.Join(c.path, "memory.pressure")),
 	}
 	if len(memoryEvents) > 0 {
 		metrics.MemoryEvents = &stats.MemoryEvents{
-			Low:     getUint64Value("low", memoryEvents),
-			High:    getUint64Value("high", memoryEvents),
-			Max:     getUint64Value("max", memoryEvents),
-			Oom:     getUint64Value("oom", memoryEvents),
-			OomKill: getUint64Value("oom_kill", memoryEvents),
+			Low:     memoryEvents["low"],
+			High:    memoryEvents["high"],
+			Max:     memoryEvents["max"],
+			Oom:     memoryEvents["oom"],
+			OomKill: memoryEvents["oom_kill"],
 		}
 	}
-	metrics.Io = &stats.IOStat{Usage: readIoStats(c.path)}
+	metrics.Io = &stats.IOStat{
+		Usage: readIoStats(c.path),
+		PSI:   getStatPSIFromFile(filepath.Join(c.path, "io.pressure")),
+	}
 	metrics.Rdma = &stats.RdmaStat{
 		Current: rdmaStats(filepath.Join(c.path, "rdma.current")),
 		Limit:   rdmaStats(filepath.Join(c.path, "rdma.max")),
@@ -526,56 +652,7 @@ func (c *Manager) Stat() (*stats.Metrics, error) {
 	return &metrics, nil
 }
 
-func getUint64Value(key string, out map[string]interface{}) uint64 {
-	v, ok := out[key]
-	if !ok {
-		return 0
-	}
-	switch t := v.(type) {
-	case uint64:
-		return t
-	}
-	return 0
-}
-
-func getPidValue(key string, out map[string]interface{}) uint64 {
-	v, ok := out[key]
-	if !ok {
-		return 0
-	}
-	switch t := v.(type) {
-	case uint64:
-		return t
-	case string:
-		if t == "max" {
-			return math.MaxUint64
-		}
-	}
-	return 0
-}
-
-func readSingleFile(path string, file string, out map[string]interface{}) error {
-	f, err := os.Open(filepath.Join(path, file))
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	data, err := io.ReadAll(f)
-	if err != nil {
-		return err
-	}
-	s := strings.TrimSpace(string(data))
-	v, err := parseUint(s, 10, 64)
-	if err != nil {
-		// if we cannot parse as a uint, parse as a string
-		out[file] = s
-		return nil
-	}
-	out[file] = v
-	return nil
-}
-
-func readKVStatsFile(path string, file string, out map[string]interface{}) error {
+func readKVStatsFile(path string, file string, out map[string]uint64) error {
 	f, err := os.Open(filepath.Join(path, file))
 	if err != nil {
 		return err
@@ -620,16 +697,12 @@ func (c *Manager) freeze(path string, state State) error {
 
 func (c *Manager) isCgroupEmpty() bool {
 	// In case of any error we return true so that we exit and don't leak resources
-	out := make(map[string]interface{})
+	out := make(map[string]uint64)
 	if err := readKVStatsFile(c.path, "cgroup.events", out); err != nil {
 		return true
 	}
 	if v, ok := out["populated"]; ok {
-		populated, ok := v.(uint64)
-		if !ok {
-			return true
-		}
-		return populated == 0
+		return v == 0
 	}
 	return true
 }
@@ -637,19 +710,19 @@ func (c *Manager) isCgroupEmpty() bool {
 // MemoryEventFD returns inotify file descriptor and 'memory.events' inotify watch descriptor
 func (c *Manager) MemoryEventFD() (int, uint32, error) {
 	fpath := filepath.Join(c.path, "memory.events")
-	fd, err := syscall.InotifyInit()
+	fd, err := unix.InotifyInit()
 	if err != nil {
-		return 0, 0, errors.New("failed to create inotify fd")
+		return 0, 0, fmt.Errorf("failed to create inotify fd: %w", err)
 	}
-	wd, err := syscall.InotifyAddWatch(fd, fpath, unix.IN_MODIFY)
+	wd, err := unix.InotifyAddWatch(fd, fpath, unix.IN_MODIFY)
 	if err != nil {
-		syscall.Close(fd)
+		unix.Close(fd)
 		return 0, 0, fmt.Errorf("failed to add inotify watch for %q: %w", fpath, err)
 	}
 	// monitor to detect process exit/cgroup deletion
 	evpath := filepath.Join(c.path, "cgroup.events")
-	if _, err = syscall.InotifyAddWatch(fd, evpath, unix.IN_MODIFY); err != nil {
-		syscall.Close(fd)
+	if _, err = unix.InotifyAddWatch(fd, evpath, unix.IN_MODIFY); err != nil {
+		unix.Close(fd)
 		return 0, 0, fmt.Errorf("failed to add inotify watch for %q: %w", evpath, err)
 	}
 
@@ -664,41 +737,6 @@ func (c *Manager) EventChan() (<-chan Event, <-chan error) {
 	return ec, errCh
 }
 
-func parseMemoryEvents(out map[string]interface{}) (Event, error) {
-	e := Event{}
-	if v, ok := out["high"]; ok {
-		e.High, ok = v.(uint64)
-		if !ok {
-			return Event{}, fmt.Errorf("cannot convert high to uint64: %+v", v)
-		}
-	}
-	if v, ok := out["low"]; ok {
-		e.Low, ok = v.(uint64)
-		if !ok {
-			return Event{}, fmt.Errorf("cannot convert low to uint64: %+v", v)
-		}
-	}
-	if v, ok := out["max"]; ok {
-		e.Max, ok = v.(uint64)
-		if !ok {
-			return Event{}, fmt.Errorf("cannot convert max to uint64: %+v", v)
-		}
-	}
-	if v, ok := out["oom"]; ok {
-		e.OOM, ok = v.(uint64)
-		if !ok {
-			return Event{}, fmt.Errorf("cannot convert oom to uint64: %+v", v)
-		}
-	}
-	if v, ok := out["oom_kill"]; ok {
-		e.OOMKill, ok = v.(uint64)
-		if !ok {
-			return Event{}, fmt.Errorf("cannot convert oom_kill to uint64: %+v", v)
-		}
-	}
-	return e, nil
-}
-
 func (c *Manager) waitForEvents(ec chan<- Event, errCh chan<- error) {
 	defer close(errCh)
 
@@ -707,17 +745,17 @@ func (c *Manager) waitForEvents(ec chan<- Event, errCh chan<- error) {
 		errCh <- err
 		return
 	}
-	defer syscall.Close(fd)
+	defer unix.Close(fd)
 
 	for {
-		buffer := make([]byte, syscall.SizeofInotifyEvent*10)
-		bytesRead, err := syscall.Read(fd, buffer)
+		buffer := make([]byte, unix.SizeofInotifyEvent*10)
+		bytesRead, err := unix.Read(fd, buffer)
 		if err != nil {
 			errCh <- err
 			return
 		}
-		if bytesRead >= syscall.SizeofInotifyEvent {
-			out := make(map[string]interface{})
+		if bytesRead >= unix.SizeofInotifyEvent {
+			out := make(map[string]uint64)
 			if err := readKVStatsFile(c.path, "memory.events", out); err != nil {
 				// When cgroup is deleted read may return -ENODEV instead of -ENOENT from open.
 				if _, statErr := os.Lstat(filepath.Join(c.path, "memory.events")); !os.IsNotExist(statErr) {
@@ -725,12 +763,13 @@ func (c *Manager) waitForEvents(ec chan<- Event, errCh chan<- error) {
 				}
 				return
 			}
-			e, err := parseMemoryEvents(out)
-			if err != nil {
-				errCh <- err
-				return
+			ec <- Event{
+				Low:     out["low"],
+				High:    out["high"],
+				Max:     out["max"],
+				OOM:     out["oom"],
+				OOMKill: out["oom_kill"],
 			}
-			ec <- e
 			if c.isCgroupEmpty() {
 				return
 			}
@@ -746,7 +785,7 @@ func setDevices(path string, devices []specs.LinuxDeviceCgroup) error {
 	if err != nil {
 		return err
 	}
-	dirFD, err := unix.Open(path, unix.O_DIRECTORY|unix.O_RDONLY|unix.O_CLOEXEC, 0600)
+	dirFD, err := unix.Open(path, unix.O_DIRECTORY|unix.O_RDONLY|unix.O_CLOEXEC, 0o600)
 	if err != nil {
 		return fmt.Errorf("cannot get dir FD for %s", path)
 	}
@@ -763,7 +802,8 @@ func setDevices(path string, devices []specs.LinuxDeviceCgroup) error {
 // the reason this is necessary is because the "-" character has a special meaning in
 // systemd slice. For example, when creating a slice called "my-group-112233.slice",
 // systemd will create a hierarchy like this:
-//      /sys/fs/cgroup/my.slice/my-group.slice/my-group-112233.slice
+//
+//	/sys/fs/cgroup/my.slice/my-group.slice/my-group-112233.slice
 func getSystemdFullPath(slice, group string) string {
 	return filepath.Join(defaultCgroup2Path, dashesToPath(slice), dashesToPath(group))
 }
@@ -866,20 +906,70 @@ func NewSystemd(slice, group string, pid int, resources *Resources) (*Manager, e
 			newSystemdProperty("TasksMax", uint64(resources.Pids.Max)))
 	}
 
-	statusChan := make(chan string, 1)
-	if _, err := conn.StartTransientUnitContext(ctx, group, "replace", properties, statusChan); err == nil {
-		select {
-		case <-statusChan:
-		case <-time.After(time.Second):
-			logrus.Warnf("Timed out while waiting for StartTransientUnit(%s) completion signal from dbus. Continuing...", group)
-		}
-	} else if !isUnitExists(err) {
+	if err := startUnit(conn, group, properties, pid == -1); err != nil {
 		return &Manager{}, err
 	}
 
 	return &Manager{
 		path: path,
 	}, nil
+}
+
+func startUnit(conn *systemdDbus.Conn, group string, properties []systemdDbus.Property, ignoreExists bool) error {
+	ctx := context.TODO()
+
+	statusChan := make(chan string, 1)
+	defer close(statusChan)
+
+	retry := true
+	started := false
+
+	for !started {
+		if _, err := conn.StartTransientUnitContext(ctx, group, "replace", properties, statusChan); err != nil {
+			if !isUnitExists(err) {
+				return err
+			}
+
+			if ignoreExists {
+				return nil
+			}
+
+			if retry {
+				retry = false
+				// When a unit of the same name already exists, it may be a leftover failed unit.
+				// If we reset it once, systemd can try to remove it.
+				attemptFailedUnitReset(conn, group)
+				continue
+			}
+
+			return err
+		} else {
+			started = true
+		}
+	}
+
+	systemdStartUnitTimeout := 30 * time.Second
+	select {
+	case s := <-statusChan:
+		if s != "done" {
+			attemptFailedUnitReset(conn, group)
+			return fmt.Errorf("error creating systemd unit `%s`: got `%s`", group, s)
+		}
+	case <-time.After(systemdStartUnitTimeout):
+		attemptFailedUnitReset(conn, group)
+		return fmt.Errorf("timed out while waiting for StartTransientUnit(%s) completion signal from dbus after %v", group, systemdStartUnitTimeout)
+	}
+
+	return nil
+}
+
+func attemptFailedUnitReset(conn *systemdDbus.Conn, group string) {
+	ctx := context.TODO()
+	err := conn.ResetFailedUnitContext(ctx, group)
+
+	if err != nil {
+		log.G(ctx).Warnf("Unable to reset failed unit: %v", err)
+	}
 }
 
 func LoadSystemd(slice, group string) (*Manager, error) {

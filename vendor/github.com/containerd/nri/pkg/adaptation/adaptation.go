@@ -29,15 +29,16 @@ import (
 
 	"github.com/containerd/nri/pkg/api"
 	"github.com/containerd/nri/pkg/log"
+	"github.com/containerd/ttrpc"
 )
 
 const (
-	// DefaultConfigPath is the default path to the NRI configuration.
-	DefaultConfigPath = "/etc/nri/nri.conf"
 	// DefaultPluginPath is the default path to search for NRI plugins.
 	DefaultPluginPath = "/opt/nri/plugins"
 	// DefaultSocketPath is the default socket path for external plugins.
 	DefaultSocketPath = api.DefaultSocketPath
+	// PluginConfigDir is the drop-in directory for NRI-launched plugin configuration.
+	DefaultPluginConfigPath = "/etc/nri/conf.d"
 )
 
 // SyncFn is a container runtime function for state synchronization.
@@ -54,14 +55,17 @@ type Adaptation struct {
 	sync.Mutex
 	name       string
 	version    string
-	configPath string
+	dropinPath string
 	pluginPath string
 	socketPath string
+	dontListen bool
 	syncFn     SyncFn
 	updateFn   UpdateFn
-	cfg        *Config
+	clientOpts []ttrpc.ClientOpts
+	serverOpts []ttrpc.ServerOpt
 	listener   net.Listener
 	plugins    []*plugin
+	syncLock   sync.RWMutex
 }
 
 var (
@@ -72,27 +76,18 @@ var (
 // Option to apply to the NRI runtime.
 type Option func(*Adaptation) error
 
-// WithConfigPath returns an option to override the default NRI config path.
-func WithConfigPath(path string) Option {
-	return func(r *Adaptation) error {
-		r.configPath = path
-		return nil
-	}
-}
-
-// WithConfig returns an option to provide a pre-parsed NRI configuration.
-func WithConfig(cfg *Config) Option {
-	return func(r *Adaptation) error {
-		r.cfg = cfg
-		r.configPath = cfg.path
-		return nil
-	}
-}
-
 // WithPluginPath returns an option to override the default NRI plugin path.
 func WithPluginPath(path string) Option {
 	return func(r *Adaptation) error {
 		r.pluginPath = path
+		return nil
+	}
+}
+
+// WithPluginConfigPath returns an option to override the default NRI plugin config path.
+func WithPluginConfigPath(path string) Option {
+	return func(r *Adaptation) error {
+		r.dropinPath = path
 		return nil
 	}
 }
@@ -105,29 +100,48 @@ func WithSocketPath(path string) Option {
 	}
 }
 
+// WithDisabledExternalConnections returns an options to disable accepting plugin connections.
+func WithDisabledExternalConnections() Option {
+	return func(r *Adaptation) error {
+		r.dontListen = true
+		return nil
+	}
+}
+
+// WithTTRPCOptions sets extra client and server options to use for ttrpc.
+func WithTTRPCOptions(clientOpts []ttrpc.ClientOpts, serverOpts []ttrpc.ServerOpt) Option {
+	return func(r *Adaptation) error {
+		r.clientOpts = append(r.clientOpts, clientOpts...)
+		r.serverOpts = append(r.serverOpts, serverOpts...)
+		return nil
+	}
+}
+
 // New creates a new NRI Runtime.
 func New(name, version string, syncFn SyncFn, updateFn UpdateFn, opts ...Option) (*Adaptation, error) {
 	var err error
+
+	if syncFn == nil {
+		return nil, fmt.Errorf("failed to create NRI adaptation, nil SyncFn")
+	}
+	if updateFn == nil {
+		return nil, fmt.Errorf("failed to create NRI adaptation, nil UpdateFn")
+	}
 
 	r := &Adaptation{
 		name:       name,
 		version:    version,
 		syncFn:     syncFn,
 		updateFn:   updateFn,
-		configPath: DefaultConfigPath,
 		pluginPath: DefaultPluginPath,
+		dropinPath: DefaultPluginConfigPath,
 		socketPath: DefaultSocketPath,
+		syncLock:   sync.RWMutex{},
 	}
 
 	for _, o := range opts {
 		if err = o(r); err != nil {
 			return nil, fmt.Errorf("failed to apply option: %w", err)
-		}
-	}
-
-	if r.cfg == nil {
-		if r.cfg, err = ReadConfig(r.configPath); err != nil {
-			return nil, err
 		}
 	}
 
@@ -324,25 +338,48 @@ func (r *Adaptation) startPlugins() (retErr error) {
 	}()
 
 	for i, name := range names {
-		log.Infof(noCtx, "starting plugin %q...", name)
+		log.Infof(noCtx, "starting pre-installed NRI plugin %q...", name)
 
 		id := ids[i]
-
-		p, err := newLaunchedPlugin(r.pluginPath, id, name, configs[i])
+		p, err := r.newLaunchedPlugin(r.pluginPath, id, name, configs[i])
 		if err != nil {
-			return fmt.Errorf("failed to start NRI plugin %q: %w", name, err)
+			log.Warnf(noCtx, "failed to initialize pre-installed NRI plugin %q: %v", name, err)
+			continue
 		}
 
 		if err := p.start(r.name, r.version); err != nil {
-			return err
+			log.Warnf(noCtx, "failed to start pre-installed NRI plugin %q: %v", name, err)
+			continue
 		}
 
 		plugins = append(plugins, p)
 	}
 
+	// Although the error returned by syncPlugins may not be nil, r.syncFn could still ignores this error and returns a nil error.
+	// We need to make sure that the plugins are successfully synchronized in the `plugins`
+	syncPlugins := func(ctx context.Context, pods []*PodSandbox, containers []*Container) (updates []*ContainerUpdate, err error) {
+		startedPlugins := plugins
+		plugins = make([]*plugin, 0, len(plugins))
+		for _, plugin := range startedPlugins {
+			us, err := plugin.synchronize(ctx, pods, containers)
+			if err != nil {
+				plugin.stop()
+				log.Warnf(noCtx, "failed to synchronize pre-installed NRI plugin %q: %v", plugin.name(), err)
+				continue
+			}
+
+			plugins = append(plugins, plugin)
+			updates = append(updates, us...)
+			log.Infof(noCtx, "pre-installed NRI plugin %q synchronization success", plugin.name())
+		}
+		return updates, nil
+	}
+	if err := r.syncFn(noCtx, syncPlugins); err != nil {
+		return fmt.Errorf("failed to synchronize pre-installed NRI Plugins: %w", err)
+	}
+
 	r.plugins = plugins
 	r.sortPlugins()
-
 	return nil
 }
 
@@ -357,23 +394,33 @@ func (r *Adaptation) stopPlugins() {
 }
 
 func (r *Adaptation) removeClosedPlugins() {
-	active := []*plugin{}
+	var active, closed []*plugin
 	for _, p := range r.plugins {
-		if !p.isClosed() {
+		if p.isClosed() {
+			closed = append(closed, p)
+		} else {
 			active = append(active, p)
 		}
+	}
+
+	if len(closed) != 0 {
+		go func() {
+			for _, plugin := range closed {
+				plugin.stop()
+			}
+		}()
 	}
 	r.plugins = active
 }
 
 func (r *Adaptation) startListener() error {
-	if r.cfg.DisableConnections {
+	if r.dontListen {
 		log.Infof(noCtx, "connection from external plugins disabled")
 		return nil
 	}
 
 	os.Remove(r.socketPath)
-	if err := os.MkdirAll(filepath.Dir(r.socketPath), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(r.socketPath), 0700); err != nil {
 		return fmt.Errorf("failed to create socket %q: %w", r.socketPath, err)
 	}
 
@@ -408,7 +455,7 @@ func (r *Adaptation) acceptPluginConnections(l net.Listener) error {
 				return
 			}
 
-			p, err := newExternalPlugin(conn)
+			p, err := r.newExternalPlugin(conn)
 			if err != nil {
 				log.Errorf(ctx, "failed to create external plugin: %v", err)
 				continue
@@ -419,19 +466,20 @@ func (r *Adaptation) acceptPluginConnections(l net.Listener) error {
 				continue
 			}
 
-			r.Lock()
+			r.requestPluginSync()
 
 			err = r.syncFn(ctx, p.synchronize)
 			if err != nil {
 				log.Infof(ctx, "failed to synchronize plugin: %v", err)
 			} else {
+				r.Lock()
 				r.plugins = append(r.plugins, p)
 				r.sortPlugins()
+				r.Unlock()
+				log.Infof(ctx, "plugin %q connected and synchronized", p.name())
 			}
 
-			r.Unlock()
-
-			log.Infof(ctx, "plugin %q connected", p.name())
+			r.finishedPluginSync()
 		}
 	}()
 
@@ -474,7 +522,7 @@ func (r *Adaptation) discoverPlugins() ([]string, []string, []string, error) {
 				r.pluginPath, err)
 		}
 
-		cfg, err := r.cfg.getPluginConfig(idx, base)
+		cfg, err := r.getPluginConfig(idx, base)
 		if err != nil {
 			return nil, nil, nil, fmt.Errorf("failed to discover plugins in %s: %w",
 				r.pluginPath, err)
@@ -500,5 +548,32 @@ func (r *Adaptation) sortPlugins() {
 		for i, p := range r.plugins {
 			log.Infof(noCtx, "  #%d: %q (%s)", i+1, p.name(), p.qualifiedName())
 		}
+	}
+}
+
+func (r *Adaptation) requestPluginSync() {
+	r.syncLock.Lock()
+}
+
+func (r *Adaptation) finishedPluginSync() {
+	r.syncLock.Unlock()
+}
+
+type PluginSyncBlock struct {
+	r *Adaptation
+}
+
+// BlockPluginSync blocks plugins from being synchronized/fully registered.
+func (r *Adaptation) BlockPluginSync() *PluginSyncBlock {
+	r.syncLock.RLock()
+	return &PluginSyncBlock{r: r}
+}
+
+// Unblock a plugin sync. block put in place by BlockPluginSync. Safe to call
+// multiple times but only from a single goroutine.
+func (b *PluginSyncBlock) Unblock() {
+	if b != nil && b.r != nil {
+		b.r.syncLock.RUnlock()
+		b.r = nil
 	}
 }

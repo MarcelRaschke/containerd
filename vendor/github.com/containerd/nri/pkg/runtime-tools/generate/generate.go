@@ -18,6 +18,9 @@ package generate
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
+	"sort"
 	"strings"
 
 	rspec "github.com/opencontainers/runtime-spec/specs-go"
@@ -37,6 +40,7 @@ type Generator struct {
 	filterAnnotations func(map[string]string) (map[string]string, error)
 	resolveBlockIO    func(string) (*rspec.LinuxBlockIO, error)
 	resolveRdt        func(string) (*rspec.LinuxIntelRdt, error)
+	injectCDIDevices  func(*rspec.Spec, []string) error
 	checkResources    func(*rspec.LinuxResources) error
 }
 
@@ -88,6 +92,14 @@ func WithResourceChecker(fn func(*rspec.LinuxResources) error) GeneratorOption {
 	}
 }
 
+// WithCDIDeviceInjector specifies a runtime-specific function to use for CDI
+// device resolution and injection into an OCI Spec.
+func WithCDIDeviceInjector(fn func(*rspec.Spec, []string) error) GeneratorOption {
+	return func(g *Generator) {
+		g.injectCDIDevices = fn
+	}
+}
+
 // Adjust adjusts all aspects of the OCI Spec that NRI knows/cares about.
 func (g *Generator) Adjust(adjust *nri.ContainerAdjustment) error {
 	if adjust == nil {
@@ -99,8 +111,12 @@ func (g *Generator) Adjust(adjust *nri.ContainerAdjustment) error {
 	}
 	g.AdjustEnv(adjust.GetEnv())
 	g.AdjustHooks(adjust.GetHooks())
+	if err := g.InjectCDIDevices(adjust.GetCDIDevices()); err != nil {
+		return err
+	}
 	g.AdjustDevices(adjust.GetLinux().GetDevices())
 	g.AdjustCgroupsPath(adjust.GetLinux().GetCgroupsPath())
+	g.AdjustOomScoreAdj(adjust.GetLinux().GetOomScoreAdj())
 
 	resources := adjust.GetLinux().GetResources()
 	if err := g.AdjustResources(resources); err != nil {
@@ -114,6 +130,9 @@ func (g *Generator) Adjust(adjust *nri.ContainerAdjustment) error {
 	}
 
 	if err := g.AdjustMounts(adjust.GetMounts()); err != nil {
+		return err
+	}
+	if err := g.AdjustRlimits(adjust.GetRlimits()); err != nil {
 		return err
 	}
 
@@ -212,13 +231,27 @@ func (g *Generator) AdjustResources(r *nri.LinuxResources) error {
 	g.initConfigLinux()
 
 	if r.Cpu != nil {
-		g.SetLinuxResourcesCPUPeriod(r.Cpu.GetPeriod().GetValue())
-		g.SetLinuxResourcesCPUQuota(r.Cpu.GetQuota().GetValue())
-		g.SetLinuxResourcesCPUShares(r.Cpu.GetShares().GetValue())
-		g.SetLinuxResourcesCPUCpus(r.Cpu.GetCpus())
-		g.SetLinuxResourcesCPUMems(r.Cpu.GetMems())
-		g.SetLinuxResourcesCPURealtimeRuntime(r.Cpu.GetRealtimeRuntime().GetValue())
-		g.SetLinuxResourcesCPURealtimePeriod(r.Cpu.GetRealtimePeriod().GetValue())
+		if r.Cpu.Period != nil {
+			g.SetLinuxResourcesCPUPeriod(r.Cpu.GetPeriod().GetValue())
+		}
+		if r.Cpu.Quota != nil {
+			g.SetLinuxResourcesCPUQuota(r.Cpu.GetQuota().GetValue())
+		}
+		if r.Cpu.Shares != nil {
+			g.SetLinuxResourcesCPUShares(r.Cpu.GetShares().GetValue())
+		}
+		if r.Cpu.Cpus != "" {
+			g.SetLinuxResourcesCPUCpus(r.Cpu.GetCpus())
+		}
+		if r.Cpu.Mems != "" {
+			g.SetLinuxResourcesCPUMems(r.Cpu.GetMems())
+		}
+		if r.Cpu.RealtimeRuntime != nil {
+			g.SetLinuxResourcesCPURealtimeRuntime(r.Cpu.GetRealtimeRuntime().GetValue())
+		}
+		if r.Cpu.RealtimePeriod != nil {
+			g.SetLinuxResourcesCPURealtimePeriod(r.Cpu.GetRealtimePeriod().GetValue())
+		}
 	}
 	if r.Memory != nil {
 		if l := r.Memory.GetLimit().GetValue(); l != 0 {
@@ -232,7 +265,9 @@ func (g *Generator) AdjustResources(r *nri.LinuxResources) error {
 	for k, v := range r.Unified {
 		g.AddLinuxResourcesUnified(k, v)
 	}
-
+	if v := r.GetPids(); v != nil {
+		g.SetLinuxResourcesPidsLimit(v.GetLimit())
+	}
 	if g.checkResources != nil {
 		if err := g.checkResources(g.Config.Linux.Resources); err != nil {
 			return fmt.Errorf("failed to adjust resources in OCI Spec: %w", err)
@@ -289,6 +324,14 @@ func (g *Generator) AdjustCgroupsPath(path string) {
 	}
 }
 
+// AdjustOomScoreAdj adjusts the kernel's Out-Of-Memory (OOM) killer score for the container.
+// This may override kubelet's settings for OOM score.
+func (g *Generator) AdjustOomScoreAdj(score *nri.OptionalInt) {
+	if score != nil {
+		g.SetProcessOOMScoreAdj(int(score.Value))
+	}
+}
+
 // AdjustDevices adjusts the (Linux) devices in the OCI Spec.
 func (g *Generator) AdjustDevices(devices []*nri.LinuxDevice) {
 	for _, d := range devices {
@@ -303,21 +346,53 @@ func (g *Generator) AdjustDevices(devices []*nri.LinuxDevice) {
 	}
 }
 
+// InjectCDIDevices injects the requested CDI devices into the OCI Spec.
+// Devices are given by their fully qualified CDI device names. The
+// actual device injection is done using a runtime-specific CDI
+// injection function, set using the WithCDIDeviceInjector option.
+func (g *Generator) InjectCDIDevices(devices []*nri.CDIDevice) error {
+	if len(devices) == 0 || g.injectCDIDevices == nil {
+		return nil
+	}
+
+	names := []string{}
+	for _, d := range devices {
+		names = append(names, d.Name)
+	}
+
+	return g.injectCDIDevices(g.Config, names)
+}
+
+func (g *Generator) AdjustRlimits(rlimits []*nri.POSIXRlimit) error {
+	for _, l := range rlimits {
+		if l == nil {
+			continue
+		}
+		g.Config.Process.Rlimits = append(g.Config.Process.Rlimits, rspec.POSIXRlimit{
+			Type: l.Type,
+			Hard: l.Hard,
+			Soft: l.Soft,
+		})
+	}
+	return nil
+}
+
 // AdjustMounts adjusts the mounts in the OCI Spec.
 func (g *Generator) AdjustMounts(mounts []*nri.Mount) error {
-	var (
-		propagation string
-	)
+	if len(mounts) == 0 {
+		return nil
+	}
 
+	propagation := ""
 	for _, m := range mounts {
 		if destination, marked := m.IsMarkedForRemoval(); marked {
 			g.RemoveMount(destination)
 			continue
 		}
+
 		g.RemoveMount(m.Destination)
 
 		mnt := m.ToOCI(&propagation)
-
 		switch propagation {
 		case "rprivate":
 		case "rshared":
@@ -340,8 +415,58 @@ func (g *Generator) AdjustMounts(mounts []*nri.Mount) error {
 		}
 		g.AddMount(mnt)
 	}
+	g.sortMounts()
 
 	return nil
+}
+
+// sortMounts sorts the mounts in the generated OCI Spec.
+func (g *Generator) sortMounts() {
+	mounts := g.Generator.Mounts()
+	g.Generator.ClearMounts()
+	sort.Sort(orderedMounts(mounts))
+
+	// TODO(klihub): This is now a bit ugly maybe we should introduce a
+	// SetMounts([]rspec.Mount) to runtime-tools/generate.Generator. That
+	// could also take care of properly sorting the mount slice.
+
+	g.Generator.Config.Mounts = mounts
+}
+
+// orderedMounts defines how to sort an OCI Spec Mount slice.
+// This is the almost the same implementation sa used by CRI-O and Docker,
+// with a minor tweak for stable sorting order (easier to test):
+//
+//	https://github.com/moby/moby/blob/17.05.x/daemon/volumes.go#L26
+type orderedMounts []rspec.Mount
+
+// Len returns the number of mounts. Used in sorting.
+func (m orderedMounts) Len() int {
+	return len(m)
+}
+
+// Less returns true if the number of parts (a/b/c would be 3 parts) in the
+// mount indexed by parameter 1 is less than that of the mount indexed by
+// parameter 2. Used in sorting.
+func (m orderedMounts) Less(i, j int) bool {
+	ip, jp := m.parts(i), m.parts(j)
+	if ip < jp {
+		return true
+	}
+	if jp < ip {
+		return false
+	}
+	return m[i].Destination < m[j].Destination
+}
+
+// Swap swaps two items in an array of mounts. Used in sorting
+func (m orderedMounts) Swap(i, j int) {
+	m[i], m[j] = m[j], m[i]
+}
+
+// parts returns the number of parts in the destination of a mount. Used in sorting.
+func (m orderedMounts) parts(i int) int {
+	return strings.Count(filepath.Clean(m[i].Destination), string(os.PathSeparator))
 }
 
 func nopFilter(m map[string]string) (map[string]string, error) {

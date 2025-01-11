@@ -1,5 +1,4 @@
 //go:build !no_zfs
-// +build !no_zfs
 
 /*
    Copyright The containerd Authors.
@@ -19,4 +18,4 @@
 
 package builtins
 
-import _ "github.com/containerd/zfs/plugin"
+import _ "github.com/containerd/zfs/v2/plugin"

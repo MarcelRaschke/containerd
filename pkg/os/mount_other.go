@@ -1,5 +1,4 @@
 //go:build !windows && !linux
-// +build !windows,!linux
 
 /*
    Copyright The containerd Authors.
@@ -19,7 +18,7 @@
 
 package os
 
-import "github.com/containerd/containerd/mount"
+import "github.com/containerd/containerd/v2/core/mount"
 
 // LookupMount gets mount info of a given path.
 func (RealOS) LookupMount(path string) (mount.Info, error) {
