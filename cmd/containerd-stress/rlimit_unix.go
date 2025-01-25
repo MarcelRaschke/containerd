@@ -1,5 +1,4 @@
 //go:build !windows && !freebsd
-// +build !windows,!freebsd
 
 /*
    Copyright The containerd Authors.
@@ -25,19 +24,17 @@ import (
 
 func setRlimit() error {
 	rlimit := uint64(100000)
-	if rlimit > 0 {
-		var limit syscall.Rlimit
-		if err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, &limit); err != nil {
-			return err
+	var limit syscall.Rlimit
+	if err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, &limit); err != nil {
+		return err
+	}
+	if limit.Cur < rlimit {
+		limit.Cur = rlimit
+		if limit.Max < limit.Cur {
+			limit.Max = limit.Cur
 		}
-		if limit.Cur < rlimit {
-			limit.Cur = rlimit
-			if limit.Max < limit.Cur {
-				limit.Max = limit.Cur
-			}
-			if err := syscall.Setrlimit(syscall.RLIMIT_NOFILE, &limit); err != nil {
-				return err
-			}
+		if err := syscall.Setrlimit(syscall.RLIMIT_NOFILE, &limit); err != nil {
+			return err
 		}
 	}
 	return nil

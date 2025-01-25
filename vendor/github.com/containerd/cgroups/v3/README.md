@@ -188,6 +188,40 @@ if err != nil {
 }
 ```
 
+### Kill all processes in a cgroup
+
+```go
+m, err := cgroup2.LoadSystemd("/", "my-cgroup-abc.slice")
+if err != nil {
+	return err
+}
+err = m.Kill()
+if err != nil {
+	return err
+}
+```
+
+
+### Get and set cgroup type
+```go
+m, err := cgroup2.LoadSystemd("/", "my-cgroup-abc.slice")
+if err != nil {
+    return err
+}
+
+// https://www.kernel.org/doc/html/v5.0/admin-guide/cgroup-v2.html#threads
+cgType, err := m.GetType()
+if err != nil {
+    return err
+}
+fmt.Println(cgType)
+
+err = m.SetType(cgroup2.Threaded)
+if err != nil {
+    return err
+}
+```
+
 ### Attention
 
 All static path should not include `/sys/fs/cgroup/` prefix, it should start with your own cgroups name

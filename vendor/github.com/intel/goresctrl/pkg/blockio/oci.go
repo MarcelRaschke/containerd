@@ -20,8 +20,6 @@ import (
 	"fmt"
 
 	oci "github.com/opencontainers/runtime-spec/specs-go"
-
-	"github.com/intel/goresctrl/pkg/cgroups"
 )
 
 // OciLinuxBlockIO returns OCI LinuxBlockIO structure corresponding to the class.
@@ -43,8 +41,8 @@ func OciLinuxBlockIO(class string) (*oci.LinuxBlockIO, error) {
 	return &ociBlockio, nil
 }
 
-func ociLinuxWeightDevices(dws cgroups.DeviceWeights) []oci.LinuxWeightDevice {
-	if dws == nil || len(dws) == 0 {
+func ociLinuxWeightDevices(dws DeviceWeights) []oci.LinuxWeightDevice {
+	if len(dws) == 0 {
 		return nil
 	}
 	olwds := make([]oci.LinuxWeightDevice, len(dws))
@@ -57,8 +55,8 @@ func ociLinuxWeightDevices(dws cgroups.DeviceWeights) []oci.LinuxWeightDevice {
 	return olwds
 }
 
-func ociLinuxThrottleDevices(drs cgroups.DeviceRates) []oci.LinuxThrottleDevice {
-	if drs == nil || len(drs) == 0 {
+func ociLinuxThrottleDevices(drs DeviceRates) []oci.LinuxThrottleDevice {
+	if len(drs) == 0 {
 		return nil
 	}
 	oltds := make([]oci.LinuxThrottleDevice, len(drs))

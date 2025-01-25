@@ -1,5 +1,4 @@
 //go:build linux
-// +build linux
 
 /*
    Copyright The docker Authors.
@@ -26,12 +25,12 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path"
-	"strconv"
 	"strings"
 	"text/template"
 
-	exec "golang.org/x/sys/execabs"
+	"github.com/containerd/log"
 )
 
 // NOTE: This code is copied from <github.com/docker/docker/profiles/apparmor>.
@@ -54,13 +53,19 @@ profile {{.Name}} flags=(attach_disconnected,mediate_deleted) {
   capability,
   file,
   umount,
-{{if ge .Version 208096}}
   # Host (privileged) processes may send signals to container processes.
   signal (receive) peer=unconfined,
+  # runc may send signals to container processes.
+  signal (receive) peer=runc,
+  # crun may send signals to container processes.
+  signal (receive) peer=crun,
   # Manager may send signals to container processes.
   signal (receive) peer={{.DaemonProfile}},
   # Container processes may send signals amongst themselves.
   signal (send,receive) peer={{.Name}},
+{{if .RootlessKit}}
+  # https://github.com/containerd/nerdctl/issues/2730
+  signal (receive) peer={{.RootlessKit}},
 {{end}}
 
   deny @{PROC}/* w,   # deny write for all files directly in /proc (not in a subdir)
@@ -81,13 +86,12 @@ profile {{.Name}} flags=(attach_disconnected,mediate_deleted) {
   deny /sys/fs/c[^g]*/** wklx,
   deny /sys/fs/cg[^r]*/** wklx,
   deny /sys/firmware/** rwklx,
+  deny /sys/devices/virtual/powercap/** rwklx,
   deny /sys/kernel/security/** rwklx,
 
-{{if ge .Version 208095}}
   # allow processes within the container to trace each other,
   # provided all other LSM and yama setting allow it.
   ptrace (trace,tracedby,read,readby) peer={{.Name}},
-{{end}}
 }
 `
 
@@ -96,7 +100,7 @@ type data struct {
 	Imports       []string
 	InnerImports  []string
 	DaemonProfile string
-	Version       int
+	RootlessKit   string
 }
 
 func cleanProfileName(profile string) string {
@@ -122,11 +126,6 @@ func loadData(name string) (*data, error) {
 	if macroExists("abstractions/base") {
 		p.InnerImports = append(p.InnerImports, "#include <abstractions/base>")
 	}
-	ver, err := getVersion()
-	if err != nil {
-		return nil, fmt.Errorf("get apparmor_parser version: %w", err)
-	}
-	p.Version = ver
 
 	// Figure out the daemon profile.
 	currentProfile, err := os.ReadFile("/proc/self/attr/current")
@@ -136,6 +135,16 @@ func loadData(name string) (*data, error) {
 		currentProfile = nil
 	}
 	p.DaemonProfile = cleanProfileName(string(currentProfile))
+
+	// If we were running in Rootless mode, we could read `/proc/$(cat ${ROOTLESSKIT_STATE_DIR}/child_pid)/exe`,
+	// but `nerdctl apparmor load` has to be executed as the root.
+	// So, do not check ${ROOTLESSKIT_STATE_DIR} (nor EUID) here.
+	p.RootlessKit, err = exec.LookPath("rootlesskit")
+	if err != nil {
+		log.L.WithError(err).Debug("apparmor: failed to determine the RootlessKit binary path")
+		p.RootlessKit = ""
+	}
+	log.L.Debugf("apparmor: RootlessKit=%q", p.RootlessKit)
 
 	return &p, nil
 }
@@ -156,7 +165,7 @@ func load(path string) error {
 	return nil
 }
 
-// macrosExists checks if the passed macro exists.
+// macroExists checks if the passed macro exists.
 func macroExists(m string) bool {
 	_, err := os.Stat(path.Join(dir, m))
 	return err == nil
@@ -165,65 +174,6 @@ func macroExists(m string) bool {
 func aaParser(args ...string) (string, error) {
 	out, err := exec.Command("apparmor_parser", args...).CombinedOutput()
 	return string(out), err
-}
-
-func getVersion() (int, error) {
-	out, err := aaParser("--version")
-	if err != nil {
-		return -1, err
-	}
-	return parseVersion(out)
-}
-
-// parseVersion takes the output from `apparmor_parser --version` and returns
-// a representation of the {major, minor, patch} version as a single number of
-// the form MMmmPPP {major, minor, patch}.
-func parseVersion(output string) (int, error) {
-	// output is in the form of the following:
-	// AppArmor parser version 2.9.1
-	// Copyright (C) 1999-2008 Novell Inc.
-	// Copyright 2009-2012 Canonical Ltd.
-
-	version, _, _ := strings.Cut(output, "\n")
-	if i := strings.LastIndex(version, " "); i >= 0 {
-		version = version[i+1:]
-	}
-
-	// trim "-beta1" suffix from version="3.0.0-beta1" if exists
-	version, _, _ = strings.Cut(version, "-")
-	// also trim tilde
-	version, _, _ = strings.Cut(version, "~")
-
-	// split by major minor version
-	v := strings.SplitN(version, ".", 4)
-	if len(v) == 0 || len(v) > 3 {
-		return -1, fmt.Errorf("parsing version failed for output: `%s`", output)
-	}
-
-	// Default the versions to 0.
-	var majorVersion, minorVersion, patchLevel int
-
-	majorVersion, err := strconv.Atoi(v[0])
-	if err != nil {
-		return -1, err
-	}
-
-	if len(v) > 1 {
-		minorVersion, err = strconv.Atoi(v[1])
-		if err != nil {
-			return -1, err
-		}
-	}
-	if len(v) > 2 {
-		patchLevel, err = strconv.Atoi(v[2])
-		if err != nil {
-			return -1, err
-		}
-	}
-
-	// major*10^5 + minor*10^3 + patch*10^0
-	numericVersion := majorVersion*1e5 + minorVersion*1e3 + patchLevel
-	return numericVersion, nil
 }
 
 func isLoaded(name string) (bool, error) {

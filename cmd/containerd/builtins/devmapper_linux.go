@@ -1,5 +1,4 @@
 //go:build !no_devmapper
-// +build !no_devmapper
 
 /*
    Copyright The containerd Authors.
@@ -19,4 +18,4 @@
 
 package builtins
 
-import _ "github.com/containerd/containerd/snapshots/devmapper/plugin"
+import _ "github.com/containerd/containerd/v2/plugins/snapshots/devmapper/plugin"

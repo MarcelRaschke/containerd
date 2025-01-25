@@ -129,7 +129,7 @@ func (s IDSet) String() string {
 
 // StringWithSeparator returns the set as a string, separated with the given separator.
 func (s IDSet) StringWithSeparator(args ...string) string {
-	if s == nil || len(s) == 0 {
+	if len(s) == 0 {
 		return ""
 	}
 
@@ -169,7 +169,7 @@ func (s *IDSet) UnmarshalJSON(data []byte) error {
 	}
 
 	for _, idstr := range strings.Split(str, ",") {
-		id, err := strconv.ParseUint(idstr, 10, 0)
+		id, err := strconv.ParseInt(idstr, 10, 0)
 		if err != nil {
 			return fmt.Errorf("invalid IDSet entry '%s': %v", idstr, err)
 		}

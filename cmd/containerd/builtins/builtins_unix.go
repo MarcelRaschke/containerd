@@ -1,5 +1,4 @@
 //go:build darwin || freebsd || solaris
-// +build darwin freebsd solaris
 
 /*
    Copyright The containerd Authors.
@@ -20,5 +19,7 @@
 package builtins
 
 import (
-	_ "github.com/containerd/containerd/snapshots/native/plugin"
+	_ "github.com/containerd/containerd/v2/plugins/diff/walking/plugin"
+	_ "github.com/containerd/containerd/v2/plugins/snapshots/blockfile/plugin"
+	_ "github.com/containerd/containerd/v2/plugins/snapshots/native/plugin"
 )

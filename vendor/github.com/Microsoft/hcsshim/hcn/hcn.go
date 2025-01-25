@@ -10,7 +10,7 @@ import (
 	"github.com/Microsoft/go-winio/pkg/guid"
 )
 
-//go:generate go run ../mksyscall_windows.go -output zsyscall_windows.go hcn.go
+//go:generate go run github.com/Microsoft/go-winio/tools/mkwinsyscall -output zsyscall_windows.go hcn.go
 
 /// HNS V1 API
 
@@ -228,7 +228,7 @@ func IPv6DualStackSupported() error {
 	return platformDoesNotSupportError("IPv6 DualStack")
 }
 
-//L4proxySupported returns an error if the HCN version does not support L4Proxy
+// L4proxySupported returns an error if the HCN version does not support L4Proxy
 func L4proxyPolicySupported() error {
 	supported, err := GetCachedSupportedFeatures()
 	if err != nil {
@@ -262,6 +262,18 @@ func SetPolicySupported() error {
 		return nil
 	}
 	return platformDoesNotSupportError("SetPolicy")
+}
+
+// ModifyLoadbalancerSupported returns an error if the HCN version does not support ModifyLoadbalancer.
+func ModifyLoadbalancerSupported() error {
+	supported, err := GetCachedSupportedFeatures()
+	if err != nil {
+		return err
+	}
+	if supported.ModifyLoadbalancer {
+		return nil
+	}
+	return platformDoesNotSupportError("ModifyLoadbalancer")
 }
 
 // VxlanPortSupported returns an error if the HCN version does not support configuring the VXLAN TCP port.
@@ -310,6 +322,30 @@ func NestedIpSetSupported() error {
 		return nil
 	}
 	return platformDoesNotSupportError("NestedIpSet")
+}
+
+// DisableHostPortSupported returns an error if the HCN version does not support DisableHostPort flag
+func DisableHostPortSupported() error {
+	supported, err := GetCachedSupportedFeatures()
+	if err != nil {
+		return err
+	}
+	if supported.DisableHostPort {
+		return nil
+	}
+	return platformDoesNotSupportError("DisableHostPort")
+}
+
+// AccelnetSupported returns an error if the HCN version does not support Accelnet Feature.
+func AccelnetSupported() error {
+	supported, err := GetCachedSupportedFeatures()
+	if err != nil {
+		return err
+	}
+	if supported.Accelnet {
+		return nil
+	}
+	return platformDoesNotSupportError("Accelnet")
 }
 
 // RequestType are the different operations performed to settings.

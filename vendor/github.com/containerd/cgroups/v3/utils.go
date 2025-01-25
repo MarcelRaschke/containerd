@@ -19,16 +19,17 @@ package cgroups
 import (
 	"bufio"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 
+	"github.com/moby/sys/userns"
 	"golang.org/x/sys/unix"
 )
 
 var (
-	nsOnce    sync.Once
-	inUserNS  bool
 	checkMode sync.Once
 	cgMode    CGMode
 )
@@ -75,33 +76,49 @@ func Mode() CGMode {
 
 // RunningInUserNS detects whether we are currently running in a user namespace.
 // Copied from github.com/lxc/lxd/shared/util.go
+//
+// Deprecated: use [userns.RunningInUserNS].
 func RunningInUserNS() bool {
-	nsOnce.Do(func() {
-		file, err := os.Open("/proc/self/uid_map")
-		if err != nil {
-			// This kernel-provided file only exists if user namespaces are supported
-			return
-		}
-		defer file.Close()
+	return userns.RunningInUserNS()
+}
 
-		buf := bufio.NewReader(file)
-		l, _, err := buf.ReadLine()
-		if err != nil {
-			return
-		}
+// ParseCgroupFileUnified returns legacy subsystem paths as the first value,
+// and returns the unified path as the second value.
+func ParseCgroupFileUnified(path string) (map[string]string, string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, "", err
+	}
+	defer f.Close()
+	return ParseCgroupFromReaderUnified(f)
+}
 
-		line := string(l)
-		var a, b, c int64
-		fmt.Sscanf(line, "%d %d %d", &a, &b, &c)
-
-		/*
-		 * We assume we are in the initial user namespace if we have a full
-		 * range - 4294967295 uids starting at uid 0.
-		 */
-		if a == 0 && b == 0 && c == 4294967295 {
-			return
+// ParseCgroupFromReaderUnified returns legacy subsystem paths as the first value,
+// and returns the unified path as the second value.
+func ParseCgroupFromReaderUnified(r io.Reader) (map[string]string, string, error) {
+	var (
+		cgroups = make(map[string]string)
+		unified = ""
+		s       = bufio.NewScanner(r)
+	)
+	for s.Scan() {
+		var (
+			text  = s.Text()
+			parts = strings.SplitN(text, ":", 3)
+		)
+		if len(parts) < 3 {
+			return nil, unified, fmt.Errorf("invalid cgroup entry: %q", text)
 		}
-		inUserNS = true
-	})
-	return inUserNS
+		for _, subs := range strings.Split(parts[1], ",") {
+			if subs == "" {
+				unified = parts[2]
+			} else {
+				cgroups[subs] = parts[2]
+			}
+		}
+	}
+	if err := s.Err(); err != nil {
+		return nil, unified, err
+	}
+	return cgroups, unified, nil
 }

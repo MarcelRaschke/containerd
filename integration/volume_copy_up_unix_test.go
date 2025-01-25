@@ -1,5 +1,4 @@
 //go:build !windows
-// +build !windows
 
 /*
    Copyright The containerd Authors.
@@ -21,12 +20,11 @@ package integration
 
 import (
 	"fmt"
-
-	exec "golang.org/x/sys/execabs"
+	"os/exec"
 )
 
 func getOwnership(path string) (string, error) {
-	hostCmd := fmt.Sprintf("stat -c %%U:%%G '%s'", path)
+	hostCmd := fmt.Sprintf("stat -c %%u:%%g '%s'", path)
 	output, err := exec.Command("sh", "-c", hostCmd).CombinedOutput()
 	if err != nil {
 		return "", err

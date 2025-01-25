@@ -39,18 +39,20 @@ import (
 	"runtime"
 	"sync"
 
-	"github.com/containerd/containerd/mount"
+	"github.com/containerd/containerd/v2/core/mount"
 	cnins "github.com/containernetworking/plugins/pkg/ns"
 	"github.com/moby/sys/symlink"
 	"golang.org/x/sys/unix"
 )
 
 // Some of the following functions are migrated from
-// https://github.com/containernetworking/plugins/blob/master/pkg/testutils/netns_linux.go
+// https://github.com/containernetworking/plugins/blob/main/pkg/testutils/netns_linux.go
 
 // newNS creates a new persistent (bind-mounted) network namespace and returns the
 // path to the network namespace.
-func newNS(baseDir string) (nsPath string, err error) {
+// If pid is not 0, returns the netns from that pid persistently mounted. Otherwise,
+// a new netns is created.
+func newNS(baseDir string, pid uint32) (nsPath string, err error) {
 	b := make([]byte, 16)
 
 	_, err = rand.Read(b)
@@ -80,6 +82,16 @@ func newNS(baseDir string) (nsPath string, err error) {
 			os.RemoveAll(nsPath)
 		}
 	}()
+
+	if pid != 0 {
+		procNsPath := getNetNSPathFromPID(pid)
+		// bind mount the netns onto the mount point. This causes the namespace
+		// to persist, even when there are no threads in the ns.
+		if err = unix.Mount(procNsPath, nsPath, "none", unix.MS_BIND, ""); err != nil {
+			return "", fmt.Errorf("failed to bind mount ns src: %v at %s: %w", procNsPath, nsPath, err)
+		}
+		return nsPath, nil
+	}
 
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -155,14 +167,29 @@ func getCurrentThreadNetNSPath() string {
 	return fmt.Sprintf("/proc/%d/task/%d/ns/net", os.Getpid(), unix.Gettid())
 }
 
+func getNetNSPathFromPID(pid uint32) string {
+	return fmt.Sprintf("/proc/%d/ns/net", pid)
+}
+
 // NetNS holds network namespace.
 type NetNS struct {
 	path string
 }
 
 // NewNetNS creates a network namespace.
+// The name of the network namespace is randomly generated.
+// The returned netns is created under baseDir, with its path
+// following the pattern "baseDir/<generated-name>".
 func NewNetNS(baseDir string) (*NetNS, error) {
-	path, err := newNS(baseDir)
+	return NewNetNSFromPID(baseDir, 0)
+}
+
+// NewNetNSFromPID returns the netns from pid or a new netns if pid is 0.
+// The name of the network namespace is randomly generated.
+// The returned netns is created under baseDir, with its path
+// following the pattern "baseDir/<generated-name>".
+func NewNetNSFromPID(baseDir string, pid uint32) (*NetNS, error) {
+	path, err := newNS(baseDir, pid)
 	if err != nil {
 		return nil, fmt.Errorf("failed to setup netns: %w", err)
 	}

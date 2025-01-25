@@ -18,8 +18,8 @@ package cgroup1
 
 import (
 	"bufio"
+	"bytes"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -28,6 +28,7 @@ import (
 
 	"github.com/containerd/cgroups/v3"
 	units "github.com/docker/go-units"
+	"github.com/moby/sys/userns"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 )
 
@@ -53,7 +54,7 @@ func defaults(root string) ([]Subsystem, error) {
 	}
 	// only add the devices cgroup if we are not in a user namespace
 	// because modifications are not allowed
-	if !cgroups.RunningInUserNS() {
+	if !userns.RunningInUserNS() {
 		s = append(s, NewDevices(root))
 	}
 	// add the hugetlb cgroup if error wasn't due to missing hugetlb
@@ -132,11 +133,25 @@ func hugePageSizes() ([]string, error) {
 }
 
 func readUint(path string) (uint64, error) {
-	v, err := os.ReadFile(path)
+	f, err := os.Open(path)
 	if err != nil {
 		return 0, err
 	}
-	return parseUint(strings.TrimSpace(string(v)), 10, 64)
+	defer f.Close()
+
+	// We should only need 20 bytes for the max uint64, but for a nice power of 2
+	// lets use 32.
+	b := make([]byte, 32)
+	n, err := f.Read(b)
+	if err != nil {
+		return 0, err
+	}
+	s := string(bytes.TrimSpace(b[:n]))
+	if s == "max" {
+		// Return 0 for the max value to maintain backward compatibility.
+		return 0, nil
+	}
+	return parseUint(s, 10, 64)
 }
 
 func parseUint(s string, base, bitSize int) (uint64, error) {
@@ -180,49 +195,18 @@ func parseKV(raw string) (string, uint64, error) {
 // etc.
 //
 // The resulting map does not have an element for cgroup v2 unified hierarchy.
-// Use ParseCgroupFileUnified to get the unified path.
+// Use [cgroups.ParseCgroupFileUnified] to get the unified path.
 func ParseCgroupFile(path string) (map[string]string, error) {
-	x, _, err := ParseCgroupFileUnified(path)
+	x, _, err := cgroups.ParseCgroupFileUnified(path)
 	return x, err
 }
 
 // ParseCgroupFileUnified returns legacy subsystem paths as the first value,
 // and returns the unified path as the second value.
+//
+// Deprecated: use [cgroups.ParseCgroupFileUnified] instead .
 func ParseCgroupFileUnified(path string) (map[string]string, string, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, "", err
-	}
-	defer f.Close()
-	return parseCgroupFromReaderUnified(f)
-}
-
-func parseCgroupFromReaderUnified(r io.Reader) (map[string]string, string, error) {
-	var (
-		cgroups = make(map[string]string)
-		unified = ""
-		s       = bufio.NewScanner(r)
-	)
-	for s.Scan() {
-		var (
-			text  = s.Text()
-			parts = strings.SplitN(text, ":", 3)
-		)
-		if len(parts) < 3 {
-			return nil, unified, fmt.Errorf("invalid cgroup entry: %q", text)
-		}
-		for _, subs := range strings.Split(parts[1], ",") {
-			if subs == "" {
-				unified = parts[2]
-			} else {
-				cgroups[subs] = parts[2]
-			}
-		}
-	}
-	if err := s.Err(); err != nil {
-		return nil, unified, err
-	}
-	return cgroups, unified, nil
+	return cgroups.ParseCgroupFileUnified(path)
 }
 
 func getCgroupDestination(subsystem string) (string, error) {
@@ -253,9 +237,9 @@ func getCgroupDestination(subsystem string) (string, error) {
 	return "", ErrNoCgroupMountDestination
 }
 
-func pathers(subystems []Subsystem) []pather {
+func pathers(subsystems []Subsystem) []pather {
 	var out []pather
-	for _, s := range subystems {
+	for _, s := range subsystems {
 		if p, ok := s.(pather); ok {
 			out = append(out, p)
 		}

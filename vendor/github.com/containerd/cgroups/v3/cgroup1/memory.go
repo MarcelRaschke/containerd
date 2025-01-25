@@ -43,7 +43,7 @@ type memoryThresholdEvent struct {
 	swap      bool
 }
 
-// MemoryThresholdEvent returns a new memory threshold event to be used with RegisterMemoryEvent.
+// MemoryThresholdEvent returns a new [MemoryEvent] representing the memory threshold set.
 // If swap is true, the event will be registered using memory.memsw.usage_in_bytes
 func MemoryThresholdEvent(threshold uint64, swap bool) MemoryEvent {
 	return &memoryThresholdEvent{
@@ -83,7 +83,7 @@ type memoryPressureEvent struct {
 	hierarchy     EventNotificationMode
 }
 
-// MemoryPressureEvent returns a new memory pressure event to be used with RegisterMemoryEvent.
+// MemoryPressureEvent returns a new [MemoryEvent] representing the memory pressure set.
 func MemoryPressureEvent(pressureLevel MemoryPressureLevel, hierarchy EventNotificationMode) MemoryEvent {
 	return &memoryPressureEvent{
 		pressureLevel,
@@ -433,7 +433,7 @@ func getMemorySettings(resources *specs.LinuxResources) []memorySettings {
 		},
 		{
 			name:  "kmem.limit_in_bytes",
-			value: mem.Kernel,
+			value: mem.Kernel, //nolint:staticcheck // SA1019: mem.Kernel is deprecated
 		},
 		{
 			name:  "kmem.tcp.limit_in_bytes",
@@ -454,6 +454,9 @@ func getOomControlValue(mem *specs.LinuxMemory) *int64 {
 	if mem.DisableOOMKiller != nil && *mem.DisableOOMKiller {
 		i := int64(1)
 		return &i
+	} else if mem.DisableOOMKiller != nil && !*mem.DisableOOMKiller {
+		i := int64(0)
+		return &i
 	}
 	return nil
 }
@@ -472,7 +475,7 @@ func (m *memoryController) memoryEvent(path string, event MemoryEvent) (uintptr,
 	defer evtFile.Close()
 	data := fmt.Sprintf("%d %d %s", efd, evtFile.Fd(), event.Arg())
 	evctlPath := filepath.Join(root, "cgroup.event_control")
-	if err := os.WriteFile(evctlPath, []byte(data), 0700); err != nil {
+	if err := os.WriteFile(evctlPath, []byte(data), 0o700); err != nil {
 		unix.Close(efd)
 		return 0, err
 	}
